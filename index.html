@@ -42,7 +42,7 @@ const CENTER=[6.9583,50.9413];
 const ORS="https://api.openrouteservice.org";
 const $=id=>document.getElementById(id);
 let key="",addr="",start=null,seed=1,layer=null,marker=null;
-let viaText="",viaPt=null,viaMarker=null;
+let viaText="",viaName="",viaPt=null,viaMarker=null;
 try{key=localStorage.getItem("ors_key")||"";addr=localStorage.getItem("start_addr")||"";$("via").value=localStorage.getItem("via_text")||""}catch(e){}
 $("addr").value=addr;
 if(!key)$("kd").open=true;
@@ -64,6 +64,16 @@ async function geocode(text){
  const j=await r.json();
  if(!j.features||!j.features.length)throw new Error("nicht gefunden");
  return j.features[0].geometry.coordinates;
+}
+// Orte/Parks über OpenStreetMap-Suche (Nominatim), nur im Raum Köln
+async function place(q){
+ const vb="6.78,51.03,7.15,50.83";
+ for(const s of [q,q+" Köln"]){
+  const r=await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&accept-language=de&countrycodes=de&viewbox=${vb}&bounded=1&q=${encodeURIComponent(s)}`);
+  const j=await r.json();
+  if(j.length)return {pt:[+j[0].lon,+j[0].lat],name:j[0].display_name.split(",").slice(0,2).join(",").trim()};
+ }
+ throw new Error("nicht gefunden");
 }
 // Fähren sind immer ausgeschlossen
 async function ors(coords,extra){
@@ -102,7 +112,7 @@ async function run(){
    marker=L.circleMarker([start[1],start[0]],{radius:8,color:"#fff",weight:3,fillColor:"#3b82f6",fillOpacity:1}).addTo(map)}
   if(v!==viaText||(v&&!viaPt)){viaText=v;viaPt=null;if(viaMarker){map.removeLayer(viaMarker);viaMarker=null}
    try{localStorage.setItem("via_text",v)}catch(e){}
-   if(v){try{viaPt=await geocode(/köln/i.test(v)?v:v+", Köln")}catch(e){throw new Error("Gebiet „"+v+"“ nicht gefunden")}
+   if(v){try{const pl=await place(v);viaPt=pl.pt;viaName=pl.name}catch(e){throw new Error("Gebiet „"+v+"“ nicht gefunden")}
     viaMarker=L.circleMarker([viaPt[1],viaPt[0]],{radius:7,color:"#fff",weight:2,fillColor:"#fc4c02",fillOpacity:1}).addTo(map)}}
   const feat=viaPt?await viaRoute(start,viaPt,km):await ors([start],{round_trip:{length:km*1000,points:4,seed}});
   const c=feat.geometry.coordinates,ll=c.map(p=>[p[1],p[0]]);
@@ -115,7 +125,7 @@ async function run(){
   marker.bringToFront();if(viaMarker)viaMarker.bringToFront();
   map.fitBounds(L.latLngBounds(ll),{padding:[40,40]});
   const d=feat.properties.summary.distance/1000;
-  $("info").textContent=`${d.toFixed(1).replace(".",",")} km · ca. ${Math.round(d*6)} min bei 6:00/km`+(viaPt?" · über "+viaText:"")+" · ohne Fähren";
+  $("info").textContent=`${d.toFixed(1).replace(".",",")} km · ca. ${Math.round(d*6)} min bei 6:00/km`+(viaPt?" · über "+viaName:"")+" · ohne Fähren";
   const n=8,wp=[];for(let i=1;i<=n;i++){const p=c[Math.floor(i*c.length/(n+1))];wp.push(p[1].toFixed(5)+","+p[0].toFixed(5))}
   const g=$("gm");g.style.display="block";
   g.href="https://www.google.com/maps/dir/?api=1&travelmode=walking&origin="+encodeURIComponent(addr)+"&destination="+encodeURIComponent(addr)+"&waypoints="+encodeURIComponent(wp.join("|"));
