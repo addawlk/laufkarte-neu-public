@@ -36,13 +36,13 @@ label.c{font-size:.9rem;display:flex;gap:6px;align-items:center;flex:1}
 <div class="body">
 <div class="row"><input type="text" id="addr" placeholder="Startadresse (Straße Nr., Köln)" autocomplete="street-address"></div>
 <div class="row"><input type="text" id="q" placeholder="Ort/Park suchen und als Punkt setzen"><button id="add" style="flex:0 0 auto">+ Punkt</button></div>
-<div class="row"><label class="c"><input type="checkbox" id="green" checked> 🌳 Parkwege bevorzugen</label></div>
 <div class="row"><label for="ret" style="font-size:.9rem">Rückweg</label><select id="ret"><option value="loop">Anderer Weg zurück (Rundkurs)</option><option value="same">Genau den gleichen Weg zurück</option><option value="none">Kein Rückweg (A → B)</option></select></div>
 <div class="row"><button class="p" id="sim">🔄 Ähnliche Route</button><button id="orig">Original</button></div>
 <div class="row"><button id="undo">↶ Letzter Punkt</button><button id="clear">Alle löschen</button></div>
 <div id="info">Tippe auf die Karte, um Punkte in deiner Reihenfolge zu setzen.</div>
+<button id="gprep" style="display:none;margin-top:8px;width:100%">🗺 Für Google Maps vorbereiten</button>
 <a class="btn" id="gm" target="_blank" rel="noopener">In Google Maps öffnen</a>
-<div class="hint">Punkte lassen sich ziehen. Langes Drücken auf einen Punkt löscht ihn. „Ähnliche Route“ erzeugt Varianten um deine Punkte, „Original“ zeigt wieder die direkte Route. Die kleinen weißen Punkte sind die höchstens 8 Punkte, die an Google Maps übergeben werden.</div>
+<div class="hint">Punkte lassen sich ziehen. Langes Drücken auf einen Punkt löscht ihn. „Ähnliche Route“ erzeugt Varianten um deine Punkte, „Original“ zeigt wieder die direkte Route. Mit „Für Google Maps vorbereiten“ werden höchstens 8 Punkte (kleine weiße Punkte) so gewählt, dass Google möglichst genau deine Strecke läuft.</div>
 <div class="row"><label>Ohne Punkte: Rundkurs</label><input type="number" id="dist" value="8" min="1" max="40" step="0.5" inputmode="decimal"><span>km</span><button id="auto" style="flex:0 0 auto">Los</button></div>
 <details id="kd"><summary>API-Schlüssel (kostenlos, einmalig)</summary>
 <p>Für die Routenberechnung wird ein kostenloser Schlüssel von <a href="https://openrouteservice.org/dev/#/signup" target="_blank" rel="noopener">openrouteservice.org</a> benötigt.</p>
@@ -84,10 +84,9 @@ async function place(q){
  }
  throw new Error("nicht gefunden");
 }
-// Fähren und Hbf-Halle sind immer ausgeschlossen, Grünwege optional bevorzugt
+// Fähren und Hbf-Halle sind ausgeschlossen, Parkwege/ruhige Wege werden im Hintergrund immer bevorzugt
 async function ors(coords,extra){
- const gr=$("green").checked?{profile_params:{weightings:{green:1,quiet:0.7}}}:{};
- const o=Object.assign({avoid_features:["ferries"],avoid_polygons:HBF},gr,extra||{});
+ const o=Object.assign({avoid_features:["ferries"],avoid_polygons:HBF,profile_params:{weightings:{green:1,quiet:0.7}}},extra||{});
  const r=await fetch(`${ORS}/v2/directions/foot-walking/geojson`,{method:"POST",
   headers:{"Authorization":key,"Content-Type":"application/json"},
   body:JSON.stringify({coordinates:coords,radiuses:coords.map(()=>800),options:o})});
@@ -149,18 +148,46 @@ function simplify(c,m){
   if(bx<0)break;sel.splice(bi+1,0,bx)}
  return sel;
 }
-function gmLink(c,mode,fwd){
- const f=p=>p[1].toFixed(5)+","+p[0].toFixed(5),A=encodeURIComponent(addr);
- let wp,dest,pick;
- if(mode==="same"){
-  const m=simplify(fwd,5).slice(1,-1).map(i=>fwd[i]),turn=fwd[fwd.length-1];
-  wp=[...m,turn,...m.slice().reverse()];dest=A;pick=[...m,turn];
- }else if(mode==="none"){
-  wp=simplify(c,10).slice(1,-1).map(i=>c[i]);dest=encodeURIComponent(f(c[c.length-1]));pick=[...wp,c[c.length-1]];
- }else{
-  wp=simplify(c,10).slice(1,-1).map(i=>c[i]);dest=A;pick=wp;
+let cur=null;
+const segd=(p,a,b)=>{const dx=b[0]-a[0],dy=b[1]-a[1],l=dx*dx+dy*dy;let u=l?((p[0]-a[0])*dx+(p[1]-a[1])*dy)/l:0;u=Math.max(0,Math.min(1,u));return Math.hypot(p[0]-a[0]-u*dx,p[1]-a[1]-u*dy)};
+// größte Abweichung der Zielstrecke T von der simulierten Strecke S (in km) und der Index des Punktes
+function maxDev(T,S){
+ const k=Math.cos(T[0][1]*toR)*111.32,pr=p=>[p[0]*k,p[1]*111.32],SP=S.map(pr);
+ let bj=0,bd=-1;
+ for(let j=0;j<T.length;j++){const p=pr(T[j]);let m=1e9;
+  for(let i=0;i<SP.length-1;i++){const d=segd(p,SP[i],SP[i+1]);if(d<m){m=d;if(m<0.005)break}}
+  if(m>bd){bd=m;bj=j}}
+ return [bj,bd];
+}
+// Simuliert Googles kürzesten Fußweg zwischen den Punkten und fügt dort Punkte ein, wo er von deiner Strecke abweicht
+async function optimize(T,maxW,note){
+ const plain={profile_params:{weightings:{green:0,quiet:0}}};
+ let idx=simplify(T,Math.min(maxW,3)+2).slice(1,-1),dev=0;
+ for(let it=0;it<=maxW;it++){
+  const sim=await ors([T[0],...idx.map(i=>T[i]),T[T.length-1]],plain);
+  const [j,d]=maxDev(T,sim.geometry.coordinates);dev=d;note(idx.length,d);
+  if(d<0.04||idx.length>=maxW||idx.includes(j))break;
+  idx.push(j);idx.sort((x,y)=>x-y);
  }
- return {href:"https://www.google.com/maps/dir/?api=1&travelmode=walking&origin="+A+"&destination="+dest+"&waypoints="+encodeURIComponent(wp.map(f).join("|")),pick};
+ return {wp:idx.map(i=>T[i]),dev};
+}
+async function prepGoogle(){
+ if(!cur||!key)return;
+ const {c,mode,fwd}=cur,b=$("gprep");b.disabled=true;
+ try{
+  const T=mode==="same"?fwd:c,maxW=mode==="same"?3:8;
+  const {wp,dev}=await optimize(T,maxW,(n,d)=>{$("info").textContent=`Google-Punkte werden optimiert … (${n} Punkte, Abweichung ca. ${Math.round(d*1000)} m)`});
+  const f=p=>p[1].toFixed(5)+","+p[0].toFixed(5),turn=T[T.length-1];
+  let list=wp,dest=f(T[0]),pick=wp;
+  if(mode==="same"){list=[...wp,turn,...wp.slice().reverse()];pick=[...wp,turn]}
+  else if(mode==="none"){dest=f(turn);pick=[...wp,turn]}
+  const href="https://www.google.com/maps/dir/?api=1&travelmode=walking&origin="+encodeURIComponent(f(T[0]))+"&destination="+encodeURIComponent(dest)+"&waypoints="+encodeURIComponent(list.map(f).join("|"));
+  if(gmLayer)map.removeLayer(gmLayer);
+  gmLayer=L.layerGroup(pick.map(p=>L.circleMarker([p[1],p[0]],{radius:4,color:"#12151c",weight:1,fillColor:"#fff",fillOpacity:1,interactive:false}))).addTo(map);
+  const g=$("gm");g.href=href;g.style.display="block";
+  $("info").textContent=`Fertig: ${list.length} Punkte für Google Maps, geschätzte Abweichung ca. ${Math.round(dev*1000)} m.`;
+ }catch(e){$("info").textContent="Fehler bei der Vorbereitung: "+e.message}
+ b.disabled=false;
 }
 function show(feat,label,fit,mode,fwd){
  const c=feat.geometry.coordinates,ll=c.map(p=>[p[1],p[0]]);
@@ -170,24 +197,22 @@ function show(feat,label,fit,mode,fwd){
   L.polyline(ll,{color:"#fc4c02",weight:7,opacity:.4,interactive:false}),
   L.polyline(ll,{color:"#ffd2bf",weight:3,opacity:1,interactive:false})
  ]).addTo(map);
- const g=gmLink(c,mode,fwd);
- if(gmLayer)map.removeLayer(gmLayer);
- gmLayer=L.layerGroup(g.pick.map(p=>L.circleMarker([p[1],p[0]],{radius:4,color:"#12151c",weight:1,fillColor:"#fff",fillOpacity:1,interactive:false}))).addTo(map);
+ cur={c,mode,fwd};if(gmLayer){map.removeLayer(gmLayer);gmLayer=null}
  if(startMark)startMark.bringToFront();
  if(fit)map.fitBounds(L.latLngBounds(ll),{padding:[40,40]});
  const d=feat.properties.summary.distance/1000;
- $("info").textContent=`${d.toFixed(1).replace(".",",")} km · ca. ${Math.round(d*6)} min bei 6:00/km · ${label}`+(mode==="same"?" · gleicher Weg zurück":"")+($("green").checked?" · Parkwege bevorzugt":"")+" · ohne Fähren";
- const gm=$("gm");gm.style.display="block";gm.href=g.href;
+ $("info").textContent=`${d.toFixed(1).replace(".",",")} km · ca. ${Math.round(d*6)} min bei 6:00/km · ${label}`+(mode==="same"?" · gleicher Weg zurück":"")+" · Parkwege bevorzugt · ohne Fähren";
+ $("gm").style.display="none";$("gprep").style.display="block";$("gprep").disabled=false;
 }
 
 async function recompute(vary){
  if(!key){$("kd").open=true;$("info").textContent="Bitte zuerst den kostenlosen Schlüssel eintragen.";return}
- if(!pts.length){if(layer){map.removeLayer(layer);layer=null}if(gmLayer){map.removeLayer(gmLayer);gmLayer=null}$("gm").style.display="none";$("info").textContent="Tippe auf die Karte, um Punkte in deiner Reihenfolge zu setzen.";return}
+ if(!pts.length){if(layer){map.removeLayer(layer);layer=null}if(gmLayer){map.removeLayer(gmLayer);gmLayer=null}$("gm").style.display="none";$("gprep").style.display="none";$("info").textContent="Tippe auf die Karte, um Punkte in deiner Reihenfolge zu setzen.";return}
  if(!await ensureStart())return;
  const my=++req;$("info").textContent="Route wird berechnet …";
  try{
   const mode=$("ret").value,loop=mode==="loop",via=buildVia(vary);
-  const extra=vary&&$("green").checked?{profile_params:{weightings:{green:1,quiet:0.3+0.7*Math.random()}}}:{};
+  const extra=vary?{profile_params:{weightings:{green:1,quiet:0.3+0.7*Math.random()}}}:{};
   let feat=await ors([start,...via,...(loop?[start]:[])],extra),fwd=null;
   if(my!==req)return;
   if(mode==="same"){fwd=feat.geometry.coordinates;feat={geometry:{coordinates:[...fwd,...fwd.slice().reverse()]},properties:{summary:{distance:feat.properties.summary.distance*2}}}}
@@ -208,6 +233,7 @@ $("add").onclick=async()=>{
  try{const p=await place(q);if(!await ensureStart())return;pts.push(p);renderMarks();map.panTo([p[1],p[0]]);$("q").value="";schedule(false)}
  catch(e){$("info").textContent="Ort „"+q+"“ nicht gefunden. Versuche den offiziellen Namen."}
 };
+$("gprep").onclick=prepGoogle;
 $("sim").onclick=()=>recompute(true);
 $("orig").onclick=()=>{vn=0;recompute(false)};
 $("undo").onclick=()=>{pts.pop();renderMarks();recompute(false)};
@@ -220,7 +246,6 @@ $("auto").onclick=async()=>{
  try{show(await ors([start],{round_trip:{length:km*1000,points:4,seed:seed++}}),"Automatischer Rundkurs",true,"loop")}
  catch(e){$("info").textContent="Fehler: "+e.message}
 };
-$("green").onchange=()=>{if(pts.length)recompute(false)};
 $("ret").onchange=()=>{if(pts.length)recompute(false)};
 $("tog").onclick=()=>{const p=$("panel");p.classList.toggle("min");$("tog").textContent=p.classList.contains("min")?"▴":"▾"};
 $("save").onclick=()=>{key=$("key").value.trim();try{localStorage.setItem("ors_key",key)}catch(e){}
